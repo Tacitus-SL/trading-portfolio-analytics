@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from datetime import datetime
+from typing import Optional
 import asyncpg
 import os
 
@@ -171,3 +173,39 @@ async def get_portfolio_summary(user_id: int):
         result.append(row_dict)
 
     return result
+
+
+@app.get("/portfolio/{user_id}/balance")
+async def get_fiat_balance(user_id: int, as_of_date: Optional[datetime] = None):
+    if not as_of_date:
+        as_of_date = datetime.now()
+
+    query = """
+        WITH fiat_flow AS (
+            SELECT 
+                SUM(CASE WHEN action_type = 'DEPOSIT' THEN amount ELSE -amount END) AS cash_balance
+            FROM fiat_transactions
+            WHERE user_id = $1 AND created_at <= $2
+        ),
+        trading_flow AS (
+            SELECT 
+                SUM(CASE WHEN transaction_type = 'SELL' THEN (price * quantity) 
+                         WHEN transaction_type = 'BUY' THEN -(price * quantity) 
+                    END) AS trade_balance
+            FROM transactions
+            WHERE user_id = $1 AND executed_at <= $2
+        )
+        SELECT 
+            $1 AS user_id,
+            COALESCE((SELECT cash_balance FROM fiat_flow), 0) + 
+            COALESCE((SELECT trade_balance FROM trading_flow), 0) AS total_fiat_balance,
+            $2 AS calculated_at;
+    """
+
+    async with app.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(query, user_id, as_of_date)
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found or no transactions")
+
+    return dict(row)

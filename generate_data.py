@@ -1,7 +1,10 @@
 from psycopg2.extras import execute_values
+from dotenv import load_dotenv
 from faker import Faker
 import psycopg2
 import random
+import asyncpg
+import os
 
 load_dotenv()
 
@@ -69,6 +72,34 @@ def get_ids_from_table(table_name):
     ids_list = [row[0] for row in rows]
     return ids_list
 
+
+def insert_fiat_transactions():
+    user_ids = get_ids_from_table("users")
+    if not user_ids:
+        return
+
+    query = """
+        INSERT INTO fiat_transactions (user_id, action_type, amount, created_at)
+        VALUES %s;
+    """
+
+    batch = []
+    fake = Faker()
+
+    for user_id in user_ids:
+        deposit_date = fake.date_time_between(start_date='-2y', end_date='-1y')
+        deposit_amount = round(random.uniform(100000.0, 1000000.0), 2)
+        batch.append((user_id, 'DEPOSIT', deposit_amount, deposit_date))
+
+        num_withdrawals = random.randint(1, 5)
+        for _ in range(num_withdrawals):
+            wd_date = fake.date_time_between(start_date='-1y', end_date='now')
+            wd_amount = round(random.uniform(100.0, 5000.0), 2)
+            batch.append((user_id, 'WITHDRAWAL', wd_amount, wd_date))
+
+    execute_values(cur, query, batch)
+    print(f"Succesfully added {len(batch)} fiat transactions (Deposits & Withdrawals).")
+
 def insert_transactions(batch_size=10000, count=1000000):
     fake = Faker()
 
@@ -114,7 +145,7 @@ if __name__ == "__main__":
         conn.autocommit = False
         insert_stocks(stocks_list)
         insert_fake_users(1000)
-
+        insert_fiat_transactions()
         insert_transactions(batch_size=10000, count=1000000)
 
         conn.commit()
