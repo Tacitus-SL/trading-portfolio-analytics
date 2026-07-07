@@ -21,11 +21,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, title="Trading Analytics API")
 
+
 @app.get("/portfolio/{user_id}")
 async def get_portfolio(user_id: int):
     query = """
         SELECT s.ticker, s.company_name,
-            SUM(CASE WHEN t.transaction_type = 'BUY' THEN t.quantity ELSE -t.quantity END) AS stock_balance
+               SUM(CASE WHEN t.transaction_type = 'BUY' THEN t.quantity ELSE -t.quantity END) AS stock_balance
         FROM transactions t
         JOIN stocks s on t.stock_id = s.id
         WHERE t.user_id = $1
@@ -74,11 +75,99 @@ async def get_leaderboard(limit: int = 10):
         ORDER BY total_volume DESC
         LIMIT $1;
     """
-
-
-
-
     async with app.state.db_pool.acquire() as conn:
         rows = await conn.fetch(query, limit)
 
     return [dict(row) for row in rows]
+
+
+@app.get("/analytics/growth")
+async def get_mom_growth():
+    query = """
+        WITH monthly_volumes AS (
+            SELECT
+                DATE_TRUNC('month', executed_at) AS trade_month,
+                SUM(quantity * price) AS current_volume
+            FROM transactions
+            GROUP BY trade_month
+        ),
+        volumes_with_lag AS (
+            SELECT
+                trade_month,
+                current_volume,
+                LAG(current_volume) OVER (ORDER BY trade_month) AS previous_volume
+            FROM monthly_volumes
+        )
+        SELECT
+            trade_month,
+            current_volume,
+            previous_volume,
+            ROUND(((current_volume - previous_volume) / NULLIF(previous_volume, 0)) * 100, 2) AS growth_percentage
+        FROM volumes_with_lag
+        ORDER BY trade_month DESC;
+    """
+    async with app.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(query)
+
+    return [dict(row) for row in rows]
+
+
+@app.get("/analytics/whales")
+async def get_whales():
+    query = """
+        WITH user_volumes AS (
+            SELECT
+                user_id,
+                SUM(quantity * price) AS total_volume
+            FROM transactions
+            GROUP BY user_id
+        ),
+        user_percentiles AS (
+            SELECT
+                user_id,
+                total_volume,
+                NTILE(100) OVER (ORDER BY total_volume DESC) AS percentile_group
+            FROM user_volumes
+        )
+        SELECT
+            p.user_id,
+            u.name AS user_name,
+            p.total_volume,
+            p.percentile_group
+        FROM user_percentiles AS p
+        JOIN users AS u ON u.id = p.user_id
+        WHERE percentile_group = 1
+        ORDER BY p.total_volume DESC;
+    """
+    async with app.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(query)
+
+    return [dict(row) for row in rows]
+
+
+@app.get("/portfolio/{user_id}/summary")
+async def get_portfolio_summary(user_id: int):
+    query = """
+        SELECT
+            s.company_name,
+            SUM(CASE WHEN t.transaction_type = 'BUY' THEN t.quantity ELSE -t.quantity END) AS stock_balance
+        FROM transactions AS t
+        LEFT JOIN stocks AS s ON s.id = t.stock_id
+        WHERE t.user_id = $1
+        GROUP BY ROLLUP(s.company_name)
+        ORDER BY (s.company_name IS NULL) ASC, s.company_name ASC;
+    """
+    async with app.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(query, user_id)
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="Portfolio not found or empty")
+
+    result = []
+    for row in rows:
+        row_dict = dict(row)
+        if row_dict['company_name'] is None:
+            row_dict['company_name'] = "TOTAL"
+        result.append(row_dict)
+
+    return result
