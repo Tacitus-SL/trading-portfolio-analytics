@@ -1,74 +1,101 @@
-# Trading Portfolio Analytics Engine
+# TAE // Trading Analytics Engine
+[![CI Pipeline (Tests & Docker)](https://github.com/Tacitus-SL/trading-portfolio-analytics/actions/workflows/ci.yml/badge.svg)](https://github.com/Tacitus-SL/trading-portfolio-analytics/actions/workflows/ci.yml)
 
-An asynchronous, high-performance API for analyzing user trading portfolios and stock market data. Designed to handle large datasets (1,000,000+ transactions) with optimized database architecture.
+An asynchronous, high-performance API and Web Terminal for analyzing user trading portfolios and stock market data. Designed to handle large datasets (1,000,000+ transactions) with optimized database architecture, strict data integrity, and complex SQL analytics.
+
+
+![UI Preview](screenshots/ui.jpg)
 
 ## Tech Stack
-* **Language:** Python 3.10+
-* **Framework:** FastAPI
-* **Database:** PostgreSQL
-* **Driver:** `asyncpg` (Asynchronous connection pooling)
+* **Backend:** Python 3.10+, FastAPI, `asyncpg` (Connection Pooling), Pydantic
+* **Database:** PostgreSQL (Advanced SQL, CTEs, Window Functions, B-Tree Indexes)
+* **Frontend:** Vanilla JS, HTML/CSS, Chart.js (Served via Jinja2)
+* **Infrastructure:** Docker, Docker Compose
+* **Testing & CI/CD:** Pytest (Integration testing with DB isolation), GitHub Actions
 * **Data Generation:** `Faker`, `psycopg2` (Batch inserts via `execute_values`)
 
-## Key Features
-1. **Highload Data Simulation:** Custom Python script generating 1M+ realistic trading transactions and inserting them via batching in under 20 seconds.
-2. **Advanced SQL Analytics:** All heavy calculations (Window functions, moving averages, aggregations) are processed purely on the database level, preventing Python RAM overload.
-3. **Optimized DB Architecture:** Proper use of `NUMERIC` types for financial data, Foreign Key constraints (`ON DELETE CASCADE`), and B-Tree indexes.
-4. **Async API:** Non-blocking FastAPI server using connection pooling (`asyncpg`) to handle multiple concurrent requests efficiently.
+## Key Engineering Features
+1. **Highload Data Simulation:** Custom Python script generating 1M+ realistic trading and fiat transactions, inserting them via batching in under 20 seconds.
+2. **"Time-Travel" Ledger:** Fiat balance isn't hardcoded. It is calculated dynamically based on historical deposits, withdrawals, and trading volume up to any specific timestamp using CTEs.
+3. **Database Optimization:** Analyzing queries with `EXPLAIN ANALYZE` revealed a bottleneck (146ms per query). By implementing **B-Tree indexes**, execution time was reduced to **0.5ms (~300x performance increase)**.
+4. **Data Integrity:** Strict constraints (`CHECK quantity > 0`, `ENUM` types, `ON DELETE CASCADE`) shift data validation from the application layer directly to the database.
+5. **Automated CI Pipeline:** Every push triggers an isolated GitHub Actions environment that spins up PostgreSQL, runs Pytest integration tests, and builds the Docker image.
 
-## Database Optimization
-During development, analyzing queries with `EXPLAIN ANALYZE` revealed a performance bottleneck. 
-Fetching a user's portfolio took **~146ms** due to a *Sequential Scan* across 1,000,000 rows. 
+## Project Structure
+```text
+├── .github/workflows/   # CI/CD Pipeline configuration (GitHub Actions)
+├── static/ & templates/ # Vanilla JS/HTML frontend (Terminal UI)
+├── tests/               # Pytest integration tests (DB isolation per test)
+├── Dockerfile           # Backend image configuration
+├── docker-compose.yml   # Multi-container orchestration (API + DB)
+├── generate_data.py     # 1M+ rows data generation script
+├── main.py              # FastAPI application & endpoints
+├── schema.sql           # DB schema, types, and indexes (Auto-runs in Docker)
+└── requirements.txt     # Python dependencies
+```
 
-By implementing **B-Tree indexes** on the `user_id` and `stock_id` columns, the query execution time was reduced to **0.5ms** (a ~300x performance increase), switching the execution plan to an *Index Scan*.
+## Core SQL Analytics
 
-## Core SQL Queries
-
-**1. Stock Moving Average (Window Functions)**
-Calculates the moving average price for a stock based on the last 10 trades to smooth out price volatility.
+**1. Time-Travel Fiat Balance Calculation**
+Calculates the exact real-money balance by summarizing deposits, withdrawals, and trading spendings.
 ```sql
-SELECT executed_at, transaction_type, quantity, price,
-       AVG(price) OVER (
-           ORDER BY executed_at
-           ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
-       ) AS avg_price_last_10
-FROM transactions
-WHERE stock_id = $1;
+WITH fiat_flow AS (
+    SELECT SUM(CASE WHEN action_type = 'DEPOSIT' THEN amount ELSE -amount END) AS cash_balance
+    FROM fiat_transactions WHERE user_id = $1 AND created_at <= $2
+),
+trading_flow AS (
+    SELECT SUM(CASE WHEN transaction_type = 'SELL' THEN (price * quantity) 
+                    WHEN transaction_type = 'BUY' THEN -(price * quantity) END) AS trade_balance
+    FROM transactions WHERE user_id = $1 AND executed_at <= $2
+)
+SELECT 
+    u.name AS user_name,
+    COALESCE((SELECT cash_balance FROM fiat_flow), 0) + 
+    COALESCE((SELECT trade_balance FROM trading_flow), 0) AS total_fiat_balance
+FROM users AS u WHERE u.id = $1;
 ```
-**2. Leaderboard**
-Ranks users by their total trading volume using DENSE_RANK().
+**2. MoM Growth & Cohort Analysis (Window Functions)**
+Calculates Month-over-Month trading volume growth using LAG() over time intervals.
 ```sql
-SELECT DENSE_RANK() OVER (ORDER BY SUM(t.price * t.quantity) DESC) AS rank,
-       u.name AS user_name,
-       SUM(t.price * t.quantity) AS total_volume
-FROM transactions t
-JOIN users u on t.user_id = u.id
-GROUP BY u.id, u.name
-ORDER BY total_volume DESC
-LIMIT $1;
+WITH monthly_volumes AS (
+    SELECT DATE_TRUNC('month', executed_at) AS trade_month, SUM(quantity * price) AS current_volume
+    FROM transactions GROUP BY trade_month
+),
+volumes_with_lag AS (
+    SELECT trade_month, current_volume, LAG(current_volume) OVER (ORDER BY trade_month) AS previous_volume
+    FROM monthly_volumes
+)
+SELECT trade_month, current_volume, previous_volume,
+       ROUND(((current_volume - previous_volume) / NULLIF(previous_volume, 0)) * 100, 2) AS growth_percentage
+FROM volumes_with_lag;
 ```
 
-## How to Run Locally
-**1. Clone and install dependencies:**
+## Database Schema
+![](screenshots/db_schema.png)
+
+## How to Run
+**1. Clone the repository & set up environment variables:**
 ```bash
-pip install -r requirements.txt
-```
-**2. Setup Database:**
-* Create a PostgreSQL database.
-* Run the SQL commands from schema.sql to create tables and indexes.
-* Create a .env file in the root directory and add your connection string:
-```env
-DATABASE_URL=postgresql://user:password@localhost:5432/dbname
+git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
+cd YOUR_REPO_NAME
+cp .env.example .env
 ```
 
-**3. Generate 1,000,000 records:**
+**2. Spin up the containers:**
 ```bash
-python generate_data.py
+docker-compose up -d --build
 ```
 
-**4.Start the API server:**
+**3. Generate 1,000,000+ test records:**
 ```bash
-uvicorn main:app --reload
+docker exec -it tae_api python generate_data.py
 ```
 
-**5. Open Swagger UI:**
-Navigate to `http://localhost:8000/docs` in your browser.
+**4.Access the Engine:**
+* Web Terminal UI: `http://localhost:8000/`
+* Swagger API Docs: `http://localhost:8000/docs`
+
+**5. Run tests:**
+```bash
+docker exec -it tae_api pytest -v
+```
