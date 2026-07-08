@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from datetime import datetime
@@ -23,6 +25,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, title="Trading Analytics API")
 
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+async def serve_dashboard(request: Request):
+    return templates.TemplateResponse(request=request, name="index.html")
 
 @app.get("/portfolio/{user_id}")
 async def get_portfolio(user_id: int):
@@ -42,6 +50,45 @@ async def get_portfolio(user_id: int):
         raise HTTPException(status_code=404, detail="Portfolio not found or empty")
 
     return [dict(row) for row in rows]
+
+
+@app.get("/portfolio/{user_id}/balance")
+async def get_fiat_balance(user_id: int, as_of_date: Optional[datetime] = None):
+    if not as_of_date:
+        as_of_date = datetime.now()
+
+    query = """
+        WITH fiat_flow AS (
+            SELECT 
+                SUM(CASE WHEN action_type = 'DEPOSIT' THEN amount ELSE -amount END) AS cash_balance
+            FROM fiat_transactions
+            WHERE user_id = $1 AND created_at <= $2
+        ),
+        trading_flow AS (
+            SELECT 
+                SUM(CASE WHEN transaction_type = 'SELL' THEN (price * quantity) 
+                         WHEN transaction_type = 'BUY' THEN -(price * quantity) 
+                    END) AS trade_balance
+            FROM transactions
+            WHERE user_id = $1 AND executed_at <= $2
+        )
+        SELECT 
+            u.id AS user_id,
+            u.name AS user_name,
+            COALESCE((SELECT cash_balance FROM fiat_flow), 0) + 
+            COALESCE((SELECT trade_balance FROM trading_flow), 0) AS total_fiat_balance,
+            $2 AS calculated_at
+        FROM users AS u
+        WHERE u.id = $1;    
+    """
+
+    async with app.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(query, user_id, as_of_date)
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found or no transactions")
+
+    return dict(row)
 
 
 @app.get("/analytics/stock/{stock_id}/moving-average")
@@ -173,39 +220,3 @@ async def get_portfolio_summary(user_id: int):
         result.append(row_dict)
 
     return result
-
-
-@app.get("/portfolio/{user_id}/balance")
-async def get_fiat_balance(user_id: int, as_of_date: Optional[datetime] = None):
-    if not as_of_date:
-        as_of_date = datetime.now()
-
-    query = """
-        WITH fiat_flow AS (
-            SELECT 
-                SUM(CASE WHEN action_type = 'DEPOSIT' THEN amount ELSE -amount END) AS cash_balance
-            FROM fiat_transactions
-            WHERE user_id = $1 AND created_at <= $2
-        ),
-        trading_flow AS (
-            SELECT 
-                SUM(CASE WHEN transaction_type = 'SELL' THEN (price * quantity) 
-                         WHEN transaction_type = 'BUY' THEN -(price * quantity) 
-                    END) AS trade_balance
-            FROM transactions
-            WHERE user_id = $1 AND executed_at <= $2
-        )
-        SELECT 
-            $1 AS user_id,
-            COALESCE((SELECT cash_balance FROM fiat_flow), 0) + 
-            COALESCE((SELECT trade_balance FROM trading_flow), 0) AS total_fiat_balance,
-            $2 AS calculated_at;
-    """
-
-    async with app.state.db_pool.acquire() as conn:
-        row = await conn.fetchrow(query, user_id, as_of_date)
-
-    if not row:
-        raise HTTPException(status_code=404, detail="User not found or no transactions")
-
-    return dict(row)
